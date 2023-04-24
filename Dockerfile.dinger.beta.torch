@@ -1,0 +1,131 @@
+ARG CUDA_DOCKER_VERSION=11.6.0-cudnn8-devel-ubuntu20.04
+FROM nvidia/cuda:${CUDA_DOCKER_VERSION}
+
+# Arguments for the build. CUDA_DOCKER_VERSION needs to be repeated because
+# the first usage only applies to the FROM tag.
+ARG CUDA_DOCKER_VERSION=11.6.0-cudnn8-devel-ubuntu20.04
+ARG NCCL_VERSION_OVERRIDE=2.12.12-1+cuda11.6
+ARG MPI_KIND=OpenMPI
+ARG PYTHON_VERSION=3.8
+ARG GPP_VERSION=9
+ARG PYTORCH_PACKAGE=torch==1.11.0
+ARG TORCHVISION_PACKAGE=torchvision==0.12.0
+ARG HOROVOD_BUILD_FLAGS="HOROVOD_GPU_OPERATIONS=NCCL"
+ARG HOROVOD_MIXED_INSTALL=0
+
+# to avoid interaction with apt-get
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set default shell to /bin/bash
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# Log given ARGs (and all other environment vars)
+RUN env | sort
+
+# Extract ubuntu distribution version and download the corresponding key.
+# This is to fix CI failures caused by the new rotating key mechanism rolled out by Nvidia.
+# Refer to https://forums.developer.nvidia.com/t/notice-cuda-linux-repository-key-rotation/212771 for more details.
+RUN DIST=$(echo ${CUDA_DOCKER_VERSION#*ubuntu} | sed 's/\.//'); \
+    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${DIST}/x86_64/7fa2af80.pub && \
+    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${DIST}/x86_64/7fa2af80.pub
+
+# Prepare to install specific g++ versions
+RUN apt-get update -qq && apt-get install -y --no-install-recommends software-properties-common && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test
+
+# Install essential packages.
+# RUN CUDNN_MAJOR=$(cut -d '.' -f 1 <<< "${CUDNN_VERSION}"); \
+RUN \ 
+    apt-get update -qq && apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
+        wget \
+        ca-certificates \
+        cmake \
+        openssh-client \
+        openssh-server \
+        git \
+        build-essential \
+        g++-${GPP_VERSION} \
+        moreutils \
+        # libcudnn${CUDNN_MAJOR}=${CUDNN_VERSION} \
+        apt-utils \
+        libnccl2=${NCCL_VERSION_OVERRIDE} \
+        libnccl-dev=${NCCL_VERSION_OVERRIDE} && \
+    rm -rf /var/lib/apt/lists/*
+
+# setup ssh service
+RUN ssh-keygen -f /root/.ssh/id_rsa -q -N ''
+RUN cp -v /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys
+
+# Install Python.
+RUN apt-get update -qq && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-distutils && \
+    rm -rf /var/lib/apt/lists/*
+RUN ln -s -f /usr/bin/python${PYTHON_VERSION} /usr/bin/python
+RUN ln -s -f /usr/bin/python${PYTHON_VERSION} /usr/bin/python${PYTHON_VERSION/%.*/}
+RUN wget --progress=dot:mega https://bootstrap.pypa.io/get-pip.py && python get-pip.py && rm get-pip.py
+
+RUN pip install --no-cache-dir -U --force requests pytest mock pytest-forked parameterized
+
+# Install MPI.
+RUN if [[ ${MPI_KIND} == "OpenMPI" ]]; then \
+        wget --progress=dot:mega -O /tmp/openmpi-4.1.4-bin.tar.gz https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.4.tar.gz && \
+            cd /tmp && tar -zxf /tmp/openmpi-4.1.4-bin.tar.gz && \
+            mkdir openmpi-4.1.4/build && cd openmpi-4.1.4/build && ../configure --prefix=/usr/local && \
+            make -j all && make install && ldconfig && \
+            echo "mpirun -allow-run-as-root -np 2 -H localhost:2 -bind-to none -map-by slot -mca mpi_abort_print_stack 1 -tag-output" > /mpirun_command; \
+    elif [[ ${MPI_KIND} == "MPICH" ]]; then \
+        apt-get update -qq && apt-get install -y mpich && \
+            echo "mpirun -np 2 -l" > /mpirun_command; \
+    fi
+
+# Set default NCCL parameters
+RUN echo NCCL_DEBUG=INFO >> /etc/nccl.conf
+
+# Install mpi4py.
+# This requires SETUPTOOLS_USE_DISTUTILS=stdlib as with setuptools>=60.1.0 installing mpi4py broke
+# https://github.com/mpi4py/mpi4py/issues/157#issuecomment-1001022274
+RUN if [[ ${MPI_KIND} != "None" ]]; then \
+        SETUPTOOLS_USE_DISTUTILS=stdlib pip install --no-cache-dir mpi4py; \
+    fi
+
+# Pin h5py < 3 for tensorflow: https://github.com/tensorflow/tensorflow/issues/44467
+RUN pip install 'h5py<3.0' 'numpy<1.24.0' --force-reinstall
+
+# Install PyTorch (releases).
+# Pin Pillow<7.0 for torchvision < 0.5.0: https://github.com/pytorch/vision/issues/1718
+# Pin Pillow!=8.3.0 for torchvision: https://github.com/pytorch/vision/issues/4146
+RUN if [[ ${PYTORCH_PACKAGE} != "torch-nightly-cu"* ]]; then \
+        pip install --no-cache-dir ${PYTORCH_PACKAGE} ${TORCHVISION_PACKAGE} -f https://download.pytorch.org/whl/${PYTORCH_PACKAGE/*+/}/torch_stable.html; \
+        if [[ "${TORCHVISION_PACKAGE/%+*/}" == torchvision==0.[1234].* ]]; then \
+            pip install --no-cache-dir "Pillow<7.0" --no-deps; \
+        else \
+            pip install --no-cache-dir "Pillow!=8.3.0" --no-deps; \
+        fi; \
+    fi
+
+# Prefetch PyTorch datasets.
+RUN mkdir -p /work /data && wget --progress=dot:mega https://horovod-datasets.s3.amazonaws.com/pytorch_datasets.tgz -O - | tar -xzC /data
+
+### END OF CACHE ###
+COPY . /horovod
+
+# Install Horovod.
+RUN cd /horovod && \
+    pip install --upgrade protobuf==3.20.0; \
+    python setup.py sdist && \
+    ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
+    bash -c "${HOROVOD_BUILD_FLAGS} HOROVOD_WITHOUT_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITHOUT_MXNET=1 pip install --no-cache-dir -v $(ls /horovod/dist/horovod-*.tar.gz)[spark,ray]" && \
+    ldconfig
+
+# Show the effective python package version to easily spot version differences
+RUN pip freeze | sort
+
+# Assert installed package versions
+# RUN /horovod/assert-package-versions.sh
+
+# Hack PyTorch MNIST example to be smaller.
+RUN sed -i "s/'--epochs', type=int, default=10,/'--epochs', type=int, default=2,/" /horovod/examples/pytorch/pytorch_mnist.py
+
+# Export HOROVOD_MIXED_INSTALL
+ENV HOROVOD_MIXED_INSTALL=${HOROVOD_MIXED_INSTALL}
